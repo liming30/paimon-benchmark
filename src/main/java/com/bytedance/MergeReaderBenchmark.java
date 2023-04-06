@@ -17,16 +17,16 @@
  */
 package com.bytedance;
 
+import org.apache.commons.lang.RandomStringUtils;
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.codegen.RecordComparator;
+import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.mergetree.compact.DeduplicateMergeFunction;
-import org.apache.paimon.mergetree.compact.MergeFunctionTestUtils;
 import org.apache.paimon.mergetree.compact.ReducerMergeFunctionWrapper;
 import org.apache.paimon.mergetree.compact.SortMergeReader;
 import org.apache.paimon.mergetree.compact.SortMergeReaderV2;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.utils.Pair;
-import org.apache.paimon.utils.ReusingTestData;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -51,6 +51,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -71,7 +72,7 @@ import static org.openjdk.jmh.annotations.Mode.AverageTime;
 @Warmup(iterations = 3, time = 10)
 @Measurement(iterations = 10, time = 10)
 public class MergeReaderBenchmark {
-	private static final RecordComparator KEY_COMPARATOR = (a, b) -> Integer.compare(a.getInt(0), b.getInt(0));
+	private static final RecordComparator KEY_COMPARATOR = (a, b) -> a.getString(0).compareTo(b.getString(0));
 
 	@Param({"2", "5", "10", "20", "50"})
 	private int readersNum;
@@ -79,12 +80,12 @@ public class MergeReaderBenchmark {
 	@Param({"1000", "10000", "100000"})
 	private int recordNum;
 
-	List<ReusingRecordReader> readersV1;
-	List<ReusingRecordReader> readersV2;
+	List<ReusingRecordReader<BinaryString, Long>> readersV1;
+	List<ReusingRecordReader<BinaryString, Long>> readersV2;
 
-	private List<List<ReusingTestData>> testData;
+	private List<List<ReusingTestData<BinaryString, Long>>> testData;
 
-	private List<ReusingTestData> expectedData;
+	private List<ReusingTestData<BinaryString, Long>> expectedData;
 
 	public static void main(String[] args) throws RunnerException {
 		Options options = new OptionsBuilder()
@@ -100,12 +101,34 @@ public class MergeReaderBenchmark {
 		testData = generateRandomData();
 		readersV1 = new ArrayList<>(readersNum);
 		readersV2 = new ArrayList<>(readersNum);
-		for (List<ReusingTestData> readerData : testData) {
+		for (List<ReusingTestData<BinaryString, Long>> readerData : testData) {
 			List<Pair<Integer, Integer>> sequence = ReusingRecordReader.generateSequence(readerData.size());
-			readersV1.add(new ReusingRecordReader(readerData, sequence));
-			readersV2.add(new ReusingRecordReader(readerData, sequence));
+			readersV1.add(new ReusingRecordReader<>(
+					readerData,
+					sequence,
+					ReusingKeyValue::new,
+					(keyWriter, key) -> {
+						keyWriter.writeString(0, key);
+						keyWriter.complete();
+						},
+					(valueWriter, value) -> {
+						valueWriter.writeLong(0, value);
+						valueWriter.complete();
+					}));
+			readersV2.add(new ReusingRecordReader<>(
+					readerData,
+					sequence,
+					ReusingKeyValue::new,
+					(keyWriter, key) -> {
+						keyWriter.writeString(0, key);
+						keyWriter.complete();
+					},
+					(valueWriter, value) -> {
+						valueWriter.writeLong(0, value);
+						valueWriter.complete();
+					}));
 		}
-		expectedData = MergeFunctionTestUtils.getExpectedForDeduplicate(
+		expectedData = getExpectedForDeduplicate(
 				testData.stream()
 						.flatMap(Collection::stream)
 						.collect(Collectors.toList()));
@@ -113,7 +136,7 @@ public class MergeReaderBenchmark {
 
 	@Benchmark
 	@Group
-	public void readBatchV1(Blackhole blackhole) throws IOException {
+	public void minHeap(Blackhole blackhole) throws IOException {
 		readersV1.forEach(ReusingRecordReader::reset);
 		try(RecordReader<KeyValue> recordReader = new SortMergeReader<>(
 				new ArrayList<>(readersV1),
@@ -125,7 +148,7 @@ public class MergeReaderBenchmark {
 
 	@Benchmark
 	@Group
-	public void readBatchV2(Blackhole blackhole) throws IOException {
+	public void loserTree(Blackhole blackhole) throws IOException {
 		readersV2.forEach(ReusingRecordReader::reset);
 		try(RecordReader<KeyValue> recordReader = new SortMergeReaderV2<>(
 				new ArrayList<>(readersV2),
@@ -137,24 +160,39 @@ public class MergeReaderBenchmark {
 
 	private void readBatch(RecordReader<KeyValue> recordReader, Blackhole blackhole) throws IOException {
 		RecordReader.RecordIterator<KeyValue> batch;
-		Iterator<ReusingTestData> expectedIterator = expectedData.iterator();
+		Iterator<ReusingTestData<BinaryString, Long>> expectedIterator = expectedData.iterator();
 		while ((batch = recordReader.readBatch()) != null) {
 			KeyValue kv;
 			while ((kv = batch.next()) != null) {
-//				assertThat(expectedIterator.hasNext()).isTrue();
-//				ReusingTestData expected = expectedIterator.next();
-//				expected.assertEquals(kv);
+//				Assertions.assertThat(expectedIterator.hasNext()).isTrue();
+//				ReusingTestData<BinaryString, Long> expected = expectedIterator.next();
+//				expected.assertEquals(kv, keyValue -> keyValue.key().getString(0), keyValue -> keyValue.value().getLong(0));
 				blackhole.consume(kv);
 			}
 			batch.releaseBatch();
 		}
 	}
 
-	private List<List<ReusingTestData>> generateRandomData() {
-		List<List<ReusingTestData>> readersData = new ArrayList<>();
+	private List<List<ReusingTestData<BinaryString, Long>>> generateRandomData() {
+		LinkedHashSet<BinaryString> predefinedKeys = new LinkedHashSet<>(recordNum * 3);
+		while (predefinedKeys.size() < recordNum * 3) {
+			predefinedKeys.add(BinaryString.fromString(RandomStringUtils.randomAlphabetic(128)));
+		}
+
+		List<List<ReusingTestData<BinaryString, Long>>> readersData = new ArrayList<>();
 		for (int i = 0; i < readersNum; i++) {
 			readersData.add(
-					ReusingTestData.generateOrderedNoDuplicatedKeys(recordNum, false));
+					ReusingTestData.generateOrderedNoDuplicatedKeys(
+							recordNum,
+							false,
+							new ArrayList<>(predefinedKeys),
+							random -> {
+								int value = random.nextInt(10) - 5;
+								while (value == 0) {
+									value = random.nextInt(10) - 5;
+								}
+								return (long) value;
+							}));
 		}
 		return readersData;
 	}
@@ -163,5 +201,20 @@ public class MergeReaderBenchmark {
 	public void afterIteration() throws InterruptedException, IOException {
 		System.gc();
 		Thread.sleep(1000L);
+	}
+
+	public static <K extends Comparable<K>, V> List<ReusingTestData<K, V>> getExpectedForDeduplicate(
+			List<ReusingTestData<K, V>> input) {
+		input = new ArrayList<>(input);
+		input.sort(null);
+
+		List<ReusingTestData<K, V>> expected = new ArrayList<>();
+		for (int i = 0; i < input.size(); i++) {
+			ReusingTestData<K, V> data = input.get(i);
+			if (i + 1 >= input.size() || data.key != input.get(i + 1).key) {
+				expected.add(data);
+			}
+		}
+		return expected;
 	}
 }

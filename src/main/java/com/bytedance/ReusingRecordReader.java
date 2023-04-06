@@ -19,12 +19,9 @@
 package com.bytedance;
 
 import org.apache.paimon.KeyValue;
+import org.apache.paimon.data.BinaryRowWriter;
 import org.apache.paimon.reader.RecordReader;
-import org.apache.paimon.utils.OffsetRow;
 import org.apache.paimon.utils.Pair;
-import org.apache.paimon.utils.ReusingKeyValue;
-import org.apache.paimon.utils.ReusingTestData;
-import org.assertj.core.groups.Tuple;
 
 import javax.annotation.Nullable;
 
@@ -32,8 +29,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
-import static org.assertj.core.api.Assertions.as;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -41,22 +39,34 @@ import static org.assertj.core.api.Assertions.assertThat;
  * sizes (possibly empty). {@link KeyValue}s produced by the same reader is reused to test that
  * other components correctly handles the reusing.
  */
-public class ReusingRecordReader implements RecordReader<KeyValue> {
+public class ReusingRecordReader<K extends Comparable<K>, V> implements RecordReader<KeyValue> {
 
-    private final List<ReusingTestData> testData;
+    private final List<ReusingTestData<K, V>> testData;
     private final List<Pair<Integer, Integer>> sequence;
 
-    private final ReusingKeyValue reuse;
     private final List<TestRecordIterator> producedBatches;
 
+    private final Supplier<ReusingKeyValue> reuseFactory;
+    private final BiConsumer<BinaryRowWriter, K> keyUpdater;
+    private final BiConsumer<BinaryRowWriter, V> valueUpdater;
+
+    private ReusingKeyValue reuse;
     private int nextSequence;
     private boolean closed;
 
-    public ReusingRecordReader(List<ReusingTestData> testData, List<Pair<Integer, Integer>> sequence) {
+    public ReusingRecordReader(
+            List<ReusingTestData<K, V>> testData,
+            List<Pair<Integer, Integer>> sequence,
+            Supplier<ReusingKeyValue> reuseFactory,
+            BiConsumer<BinaryRowWriter, K> keyUpdater,
+            BiConsumer<BinaryRowWriter, V> valueUpdater) {
         this.testData = testData;
         this.sequence = sequence;
-        this.reuse = new ReusingKeyValue();
         this.producedBatches = new ArrayList<>(sequence.size());
+        this.reuseFactory = reuseFactory;
+        this.keyUpdater = keyUpdater;
+        this.valueUpdater = valueUpdater;
+        this.reuse = reuseFactory.get();
         this.nextSequence = 0;
         this.closed = false;
     }
@@ -91,6 +101,7 @@ public class ReusingRecordReader implements RecordReader<KeyValue> {
         closed = false;
         producedBatches.clear();
         nextSequence = 0;
+        reuse = reuseFactory.get();
     }
 
     @Override
@@ -113,8 +124,10 @@ public class ReusingRecordReader implements RecordReader<KeyValue> {
         private int next;
         private boolean released;
 
-        private TestRecordIterator(int lowerBound, int upperBound) {
-            this.upperBound = upperBound;
+        private TestRecordIterator(
+                int lowerBound,
+                int upperBound) {
+            this.upperBound = upperBound;;
 
             this.next = lowerBound;
             this.released = false;
@@ -127,7 +140,7 @@ public class ReusingRecordReader implements RecordReader<KeyValue> {
                 next = -1;
                 return null;
             }
-            KeyValue result = reuse.update(testData.get(next));
+            KeyValue result = reuse.update(testData.get(next), keyUpdater, valueUpdater);
             next++;
             return result;
         }
